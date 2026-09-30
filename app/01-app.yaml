@@ -1,0 +1,82 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: app-ns
+  # labels:
+  #   openshift.io/user-monitoring: "false"
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: sample-otel-app
+  namespace: app-ns
+  labels:
+    app: sample-otel-app
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: sample-otel-app
+  template:
+    metadata:
+      labels:
+        app: sample-otel-app
+    spec:
+      containers:
+      - name: app-container
+        image: ghcr.io/open-telemetry/demo:1.10.0-adservice
+        ports:
+        - containerPort: 9555
+          name: grpc
+        resources:
+          limits:
+            cpu: "1"
+            memory: 512Mi
+          requests:
+            cpu: 200m
+            memory: 256Mi
+        env:
+        # 0. SERVER GRPC PORT 
+        - name: AD_SERVICE_PORT
+          value: "9555"
+        # 1. PROTOCOLLO OTLP HTTP
+        # Forza l'uso di OTLP/HTTP anziché gRPC
+        - name: OTEL_EXPORTER_OTLP_PROTOCOL
+          value: "http/protobuf"
+
+        # 2. ENDPOINT DEL COLLETTORE CENTRALIZZATO IN otel-ns (Porta 4318)
+        # Sostituisci 'otel-collector' con il nome effettivo del Service Kubernetes del tuo Collector
+        - name: OTEL_EXPORTER_OTLP_ENDPOINT
+          value: "http://otel-collector.otel-ns.svc.cluster.local:4318"
+
+        # 3. CONFIGURAZIONE METADATI E SDK
+        - name: OTEL_SERVICE_NAME
+          value: "adservice-demo"
+
+        - name: OTEL_TRACES_EXPORTER
+          value: "otlp"
+        - name: OTEL_METRICS_EXPORTER
+          value: "otlp"
+
+        - name: OTEL_METRIC_EXPORT_INTERVAL
+          value: "10000"
+
+        - name: OTEL_PROPAGATORS
+          value: "tracecontext,baggage"
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: sample-otel-app-service
+  namespace: app-ns
+  labels:
+    app: sample-otel-app
+spec:
+  type: ClusterIP
+  selector:
+    app: sample-otel-app
+  ports:
+  - name: grpc              # Il nome 'grpc' fa capire al router OpenShift che si tratta di HTTP/2
+    port: 9555              # Porta del Service
+    targetPort: 9555        # Porta gRPC esposta dal container adservice
+    protocol: TCP

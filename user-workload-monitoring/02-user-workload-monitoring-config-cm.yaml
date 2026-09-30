@@ -1,0 +1,36 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: user-workload-monitoring-config
+  namespace: openshift-user-workload-monitoring
+data:
+  config.yaml: |
+    prometheus:
+      logLevel: warn
+
+      # Defines the maximum number of samples that can be accepted per target scrape.
+      # enforcedSampleLimit: 50000
+      # Defines the maximum number of labels per scrape. The default value is 0, which specifies no limit.
+      # enforcedLabelLimit: 500
+      # Defines the maximum character length for a label name/value
+      # enforcedLabelNameLengthLimit: 50
+      # enforcedLabelValueLengthLimit: 600
+      # Defines the interval between consecutive scrapes if the ServiceMonitor/PodMonitor doesn't define a scrape interval
+      scrapeInterval: 30s
+      # Defines the interval between Prometheus rule evaluations
+      evaluationInterval: 1m15s
+
+      retention: 2d
+      retentionSize: 18GB
+      volumeClaimTemplate:
+        spec:
+          storageClassName: ocs-external-storagecluster-ceph-rbd
+          resources:
+            requests:
+              storage: 20Gi
+      
+      # resources:
+      #   requests:
+      #     memory: 2Gi
+      #   limits:
+      #     memory: 4Gi
