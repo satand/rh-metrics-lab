@@ -1,0 +1,118 @@
+# App di DEMO con Micrometer (Spring Boot) che ESPORTA metriche OTLP in PUSH
+# verso il Service del collector, per riprodurre la DUPLICAZIONE per-istanza che
+# il demo adservice (OpenTelemetry SDK, connessione sticky) NON mostra.
+#
+# Perche' Micrometer duplica e l'SDK OTel no - VERIFICATO con A/B: la duplicazione
+# resta anche SENZA alcuna JVM flag di keep-alive, quindi NON e' un artefatto di config.
+#   - Micrometer pubblica a step e, di fatto, apre una NUOVA connessione HTTP a ogni
+#     push; kube-proxy (bilanciamento per-connessione sul ClusterIP) lo puo' mandare
+#     su una replica diversa ogni volta => la STESSA serie logica (stesso service.name)
+#     viene riesposta da PIU' istanze del collector (duplicazione).
+#   - L'SDK OTel del demo riusa UNA connessione keep-alive => sticky su una replica
+#     => nessuna duplicazione (comportamento tipo il gRPC che avete testato).
+#
+# PREREQUISITI:
+#   - Namespace app-ns: creato da ../app/01-app.yaml (applica prima quello, oppure
+#     decommenta il blocco Namespace qui sotto se vuoi questo file standalone).
+#   - Collector a >= 2 repliche (kubectl/oc scale, oppure HPA attivo in prod).
+#   - Costruisci e pusha l'immagine dell'app reference (./reference-app) FORZANDO
+#     l'architettura dei nodi (i tuoi sono amd64, il tuo Mac e' arm64), poi mettila
+#     nel campo image sotto. La build e' cross-arch SENZA qemu (bytecode portabile):
+#       cd reference-app
+#       podman build --platform=linux/amd64 -t <REGISTRY>/<NS>/micrometer-otlp-demo:1.0.0 .
+#       podman push    <REGISTRY>/<NS>/micrometer-otlp-demo:1.0.0
+#     Dopo un re-push sotto lo STESSO tag, forza il re-pull sul nodo:
+#       oc rollout restart deployment/sample-micrometer-app -n app-ns
+#     (oppure usa un tag nuovo/unico; imagePullPolicy e' gia' Always qui sotto).
+#
+# VERIFICA duplicazione (dopo l'apply, con 2 repliche di collector).
+# La metrica ORA cresce SOLO se invochi l'app, non da sola (nessun auto-increment).
+# 1) port-forward verso il Service gRPC (come nel README di ../app):
+#      oc port-forward svc/sample-micrometer-app-service 9555:9555 -n app-ns
+# 2) invoca N volte GetAds (come nel README di ../app, usando il .proto):
+#      for i in $(seq 1 50); do \
+#        grpcurl -plaintext -import-path reference-app/src/main/proto -proto rpc_ping.proto \
+#          -d '{"count":1}' localhost:9555 micrometerdemo.AdService/GetAds ; done
+# 3) guarda le DUE istanze del collector: rpc_server_duration_milliseconds_count
+#    deve crescere su ENTRAMBE (duplicazione) e la somma ~ N volte in piu' del vero.
+#      oc get pods -n otel-ns -l app.kubernetes.io/instance=otel -o wide
+#      oc run metrics-curl -n otel-ns --rm -i --restart=Never --image=curlimages/curl:8.8.0 \
+#        -- sh -c 'for ip in <IP1> <IP2>; do echo "-- $ip"; \
+#          curl -s http://$ip:8889/metrics | grep "rpc_server_duration_milliseconds_count{.*micrometer"; done'
+---
+# apiVersion: v1
+# kind: Namespace
+# metadata:
+#   name: app-ns
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: sample-micrometer-app
+  namespace: app-ns
+  labels:
+    app: sample-micrometer-app
+spec:
+  replicas: 1              # 1 pod-app basta: lo scatter e' PER-PUSH (ogni push = nuova connessione)
+                           # e la metrica cresce solo quando INVOCHI GetAds (nessun auto-increment)
+  selector:
+    matchLabels:
+      app: sample-micrometer-app
+  template:
+    metadata:
+      labels:
+        app: sample-micrometer-app
+    spec:
+      containers:
+      - name: app-container
+        image: quay.io/asatrian/micrometer-otlp-demo:1.0.0   # costruita da ./reference-app con --platform=linux/amd64
+        imagePullPolicy: Always   # forza re-pull: evita che il nodo resti sulla vecchia arm64 in cache
+        ports:
+        - containerPort: 8080
+          name: http
+        - containerPort: 9555
+          name: grpc            # nome 'grpc': segnala al router OpenShift che e' HTTP/2 (come ../app)
+        resources:
+          limits:
+            cpu: "1"
+            memory: 512Mi
+          requests:
+            cpu: 200m
+            memory: 256Mi
+        env:
+        # 1. ENDPOINT OTLP/HTTP DEL COLLETTORE (via Service ClusterIP), path /v1/metrics
+        #    Nota: Micrometer vuole l'URL COMPLETO (con /v1/metrics), non solo l'host.
+        - name: MANAGEMENT_OTLP_METRICS_EXPORT_URL
+          value: "http://otel-collector.otel-ns.svc.cluster.local:4318/v1/metrics"
+
+        # 2. INTERVALLO DI PUBBLICAZIONE (ogni 10s un nuovo push -> nuovo bilanciamento)
+        - name: MANAGEMENT_OTLP_METRICS_EXPORT_STEP
+          value: "10s"
+
+        # 3. Abilita esplicitamente l'export OTLP
+        - name: MANAGEMENT_OTLP_METRICS_EXPORT_ENABLED
+          value: "true"
+
+        - name: MANAGEMENT_OTLP_METRICS_EXPORT_RESOURCE_ATTRIBUTES_SERVICE_NAME
+          value: "micrometer-push-demo"
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: sample-micrometer-app-service
+  namespace: app-ns
+  labels:
+    app: sample-micrometer-app
+spec:
+  type: ClusterIP
+  selector:
+    app: sample-micrometer-app
+  ports:
+  - name: http
+    port: 8080
+    targetPort: 8080
+    protocol: TCP
+  - name: grpc
+    port: 9555
+    targetPort: 9555
+    protocol: TCP

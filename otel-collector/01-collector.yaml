@@ -214,7 +214,7 @@ spec:
       scrapeInterval: 30s
       serviceMonitorNamespaceSelector: {}
     resources: {}
-  replicas: 1
+  replicas: 2
   ipFamilyPolicy: SingleStack
   configVersions: 3
 ---

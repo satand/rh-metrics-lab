@@ -1,0 +1,22 @@
+syntax = "proto3";
+
+package micrometerdemo;
+
+option java_package = "com.example.mpdemo.grpc";
+option java_multiple_files = true;
+option java_outer_classname = "RpcPingProto";
+
+// Servizio minimo che replica la forma dell'AdService di ../app: una sola RPC
+// (GetAds) la cui invocazione fa crescere la metrica rpc.server.duration.
+message GetAdsRequest {
+  int32 count = 1;
+  repeated string context_keys = 2;
+}
+
+message GetAdsResponse {
+  repeated string ads = 1;
+}
+
+service AdService {
+  rpc GetAds (GetAdsRequest) returns (GetAdsResponse);
+}
