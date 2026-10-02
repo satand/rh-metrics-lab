@@ -1,0 +1,114 @@
+# ============================================================================
+# L2 - otel-agg  (AGGREGATOR, the only layer scraped by UWM)  [dual-layer stack, ns otel-l1l2-ns]
+# - Receives OTLP/gRPC :4317 from L1 (and OTLP/HTTP :4318 for flexibility).
+# - k8sattributes / filter / transform are NOT re-run here: resource attributes are
+#   already enriched & cleaned by L1 (re-running here would bind the 'connection', i.e.
+#   the L1 pod => WRONG K8s labels).
+# - Exposes the prometheus exporter :8889; the operator creates the ServiceMonitors
+#   (self-metrics + prometheus exporter) => UWM scrapes ONLY L2.
+# - headlessService: true => the Service 'otel-agg-collector' resolves to the L2 pod IPs
+#   (used by L1's loadbalancing 'dns' resolver). Verify real name and port 4317:
+#   oc get svc -n otel-l1l2-ns -o yaml
+# ============================================================================
+apiVersion: opentelemetry.io/v1beta1
+kind: OpenTelemetryCollector
+metadata:
+  name: otel-agg
+  namespace: otel-l1l2-ns
+spec:
+  networkPolicy:
+    enabled: true
+  observability:
+    metrics:
+      enableMetrics: true
+  deploymentUpdateStrategy: {}
+  httpRoute:
+    enabled: false
+    gateway: ''
+  config:
+    exporters:
+      debug:
+        verbosity: normal #basic
+      prometheus:
+        endpoint: '0.0.0.0:8889'
+        without_scope_info: true
+        resource_to_telemetry_conversion:
+          enabled: true
+    processors:
+      batch:
+        send_batch_max_size: 0
+        send_batch_size: 8192
+        timeout: 10s
+    receivers:
+      otlp:
+        protocols:
+          grpc:
+            endpoint: '0.0.0.0:4317'
+          http:
+            endpoint: '0.0.0.0:4318'
+    service:
+      pipelines:
+        metrics/pull:
+          receivers:
+            - otlp
+          processors:
+            - batch
+          exporters:
+            - debug
+            - prometheus
+      telemetry:
+        metrics:
+          level: basic
+          readers:
+            - pull:
+                exporter:
+                  prometheus:
+                    host: 0.0.0.0
+                    port: 8888
+                    without_scope_info: false
+                    without_type_suffix: false
+                    without_units: false
+  mode: deployment
+  headlessService: true             # <-- needed for L1's 'dns' resolver (4317)
+  replicas: 2                        # lab: 2 fixed replicas
+  # autoscaler: disabled in the lab; planned numbers (for prod). Remember: application
+  # metrics are PARTITIONED across L2 replicas, so UWM head_series stays ~constant as N
+  # changes; scale L2 on MEMORY. UWM enforcedTargetLimit >= maxReplicas.
+  # autoscaler:
+  #   minReplicas: 3
+  #   maxReplicas: 6
+  #   targetCPUUtilization: 70
+  #   targetMemoryUtilization: 75
+  #   behavior:
+  #     scaleDown:
+  #       stabilizationWindowSeconds: 300
+  #     scaleUp:
+  #       stabilizationWindowSeconds: 30
+  # resources:                        # per replica, sized to the worst case at minReplicas
+  #   requests:
+  #     cpu: 500m
+  #     memory: <slice*1.2>
+  #   limits:
+  #     cpu: 1000m
+  #     memory: <slice*2>
+  managementState: managed
+  upgradeStrategy: automatic
+  ingress:
+    route: {}
+  podDnsConfig: {}
+  daemonSetUpdateStrategy: {}
+  serviceAccount: otel-collector-sa
+  ipFamilyPolicy: SingleStack
+  configVersions: 3
+---
+# NOT applied (template, enable with HPA): protects one ring slice from voluntary drains.
+# apiVersion: policy/v1
+# kind: PodDisruptionBudget
+# metadata:
+#   name: otel-agg-pdb
+#   namespace: otel-l1l2-ns
+# spec:
+#   minAvailable: 2
+#   selector:
+#     matchLabels:
+#       app.kubernetes.io/instance: otel-agg

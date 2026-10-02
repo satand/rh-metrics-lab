@@ -36,20 +36,24 @@ spec:
             cpu: 200m
             memory: 256Mi
         env:
-        # 0. SERVER GRPC PORT 
+        # 0. gRPC server port
         - name: AD_SERVICE_PORT
           value: "9555"
-        # 1. PROTOCOLLO OTLP HTTP
-        # Forza l'uso di OTLP/HTTP anziché gRPC
+        # 1. OTLP protocol
+        # Force OTLP/HTTP instead of gRPC
         - name: OTEL_EXPORTER_OTLP_PROTOCOL
           value: "http/protobuf"
 
-        # 2. ENDPOINT DEL COLLETTORE CENTRALIZZATO IN otel-ns (Porta 4318)
-        # Sostituisci 'otel-collector' con il nome effettivo del Service Kubernetes del tuo Collector
+        # 2. Collector OTLP endpoint (port 4318). Enable ONE (default = single-layer):
+        #    single-layer: the original 'otel' CR service in otel-ns
         - name: OTEL_EXPORTER_OTLP_ENDPOINT
           value: "http://otel-collector.otel-ns.svc.cluster.local:4318"
+        #    dual-layer: the L1 'otel-edge' service in otel-l1l2-ns
+        #    (comment the block above, uncomment the two lines below):
+        # - name: OTEL_EXPORTER_OTLP_ENDPOINT
+        #   value: "http://otel-edge-collector.otel-l1l2-ns.svc.cluster.local:4318"
 
-        # 3. CONFIGURAZIONE METADATI E SDK
+        # 3. Metadata / SDK configuration
         - name: OTEL_SERVICE_NAME
           value: "adservice-demo"
 
@@ -76,7 +80,7 @@ spec:
   selector:
     app: sample-otel-app
   ports:
-  - name: grpc              # Il nome 'grpc' fa capire al router OpenShift che si tratta di HTTP/2
-    port: 9555              # Porta del Service
-    targetPort: 9555        # Porta gRPC esposta dal container adservice
+  - name: grpc              # The name 'grpc' tells the OpenShift router this is HTTP/2
+    port: 9555              # Service port
+    targetPort: 9555        # gRPC port exposed by the adservice container
     protocol: TCP

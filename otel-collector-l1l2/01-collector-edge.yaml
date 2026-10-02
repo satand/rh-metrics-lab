@@ -1,0 +1,139 @@
+# ============================================================================
+# L1 - otel-edge  (EDGE / deterministic router)   [dual-layer stack, ns otel-l1l2-ns]
+# - Receives OTLP/HTTP :4318 from the applications.
+# - Runs k8sattributes + filters + transform HERE (the 'connection' is the app pod).
+# - Routes to L2 with the loadbalancing exporter hashing on k8s.pod.name +
+#   k8s.namespace.name: the same app pod ALWAYS goes to the same L2 replica => no duplication.
+# - Does NOT expose a prometheus exporter: UWM scrapes no application data from here.
+#   Only the self-metrics ServiceMonitor (otelcol_*) stays, via enableMetrics.
+#
+# REQUIREMENT: the collector image must bundle the 'loadbalancing' exporter
+# (otelcol-contrib / otelcol-k8s distributions). If the image in use (service.name
+# 'otelcol') lacks it, set spec.image to otelcol-contrib.
+# Verify after apply: oc get servicemonitor -n otel-l1l2-ns  (L1 must have ONLY self-metrics)
+# ============================================================================
+apiVersion: opentelemetry.io/v1beta1
+kind: OpenTelemetryCollector
+metadata:
+  name: otel-edge
+  namespace: otel-l1l2-ns
+spec:
+  networkPolicy:
+    enabled: true
+  observability:
+    metrics:
+      enableMetrics: true          # self-metrics on :8888 (otelcol_*, incl. loadbalancer_*)
+  deploymentUpdateStrategy: {}
+  httpRoute:
+    enabled: false
+    gateway: ''
+  config:
+    exporters:
+      loadbalancing:               # 0.158: name 'loadbalancing' ('load_balancing' is the new name)
+        routing_key: attributes
+        routing_attributes:
+          - k8s.pod.name
+          - k8s.namespace.name
+        protocol:
+          otlp:
+            tls:
+              insecure: true       # L2 exposes plain OTLP/gRPC
+            timeout: 5s
+        resolver:
+          dns:
+            hostname: otel-agg-collector.otel-l1l2-ns.svc.cluster.local   # L2 headless Service (verify real name)
+            port: 4317
+            interval: 5s           # re-resolves the ring quickly when L2 scales
+    processors:
+      batch:
+        send_batch_max_size: 0
+        send_batch_size: 8192
+        timeout: 10s
+      filter/metrics:
+        error_mode: ignore
+        metrics:
+          metric:
+            - instrumentation_scope.name == "io.opentelemetry.runtime-telemetry-java8"
+            - instrumentation_scope.name == "io.opentelemetry.exporters.otlp-http"
+            - instrumentation_scope.name == "io.opentelemetry.sdk.logs"
+            - instrumentation_scope.name == "io.opentelemetry.sdk.trace"
+      k8sattributes:
+        extract:
+          metadata:
+            - k8s.node.name
+            - k8s.namespace.name
+            - k8s.deployment.name
+            - k8s.pod.name
+        pod_association:
+          - sources:
+              - from: resource_attribute
+                name: k8s.pod.name
+              - from: resource_attribute
+                name: k8s.namespace.name
+          - sources:
+              - from: connection
+        watch_sync_period: 30s
+      transform:
+        error_mode: ignore
+        metric_statements:
+          - context: resource
+            statements:
+              - 'set(attributes["k8s.workload.kind"], "replicaset") where IsString(attributes["k8s.replicaset.name"])'
+              - 'set(attributes["k8s.workload.name"], attributes["k8s.replicaset.name"]) where IsString(attributes["k8s.replicaset.name"])'
+              - 'set(attributes["k8s.workload.kind"], "deployment") where IsString(attributes["k8s.deployment.name"])'
+              - 'set(attributes["k8s.workload.name"], attributes["k8s.deployment.name"]) where IsString(attributes["k8s.deployment.name"])'
+              - 'delete_key(attributes, "k8s.deployment.name")'
+      transform/clean_resource:
+        error_mode: ignore
+        metric_statements:
+          - context: resource
+            statements:
+              # Keep ONLY the attributes needed to identify service and K8s infrastructure
+              - keep_keys(attributes, ["service.name", "k8s.namespace.name", "k8s.pod.name", "k8s.node.name", "k8s.workload.kind", "k8s.workload.name"])
+    receivers:
+      otlp:
+        protocols:
+          http:
+            endpoint: '0.0.0.0:4318'
+    service:
+      pipelines:
+        metrics/push:
+          receivers:
+            - otlp
+          processors:
+            - filter/metrics
+            - k8sattributes
+            - transform
+            - transform/clean_resource
+            - batch
+          exporters:
+            - loadbalancing
+      telemetry:
+        metrics:
+          level: basic
+          readers:
+            - pull:
+                exporter:
+                  prometheus:
+                    host: 0.0.0.0
+                    port: 8888
+                    without_scope_info: false
+                    without_type_suffix: false
+                    without_units: false
+  mode: deployment
+  headlessService: false
+  replicas: 2                       # lab: 2 fixed replicas
+  # autoscaler: disabled in the lab; planned numbers (for prod):
+  # autoscaler:
+  #   minReplicas: 2
+  #   maxReplicas: 4
+  #   targetCPUUtilization: 70
+  managementState: managed
+  upgradeStrategy: automatic
+  ingress:
+    route: {}
+  podDnsConfig: {}
+  daemonSetUpdateStrategy: {}
+  serviceAccount: otel-collector-sa
+  ipFamilyPolicy: SingleStack
+  configVersions: 3

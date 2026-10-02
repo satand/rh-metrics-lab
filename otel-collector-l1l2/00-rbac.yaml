@@ -1,0 +1,44 @@
+# Shared RBAC for the dual-layer stack (L1 otel-edge + L2 otel-agg), self-contained so
+# it does not collide with / depend on the single-layer stack's RBAC.
+# Needed by the k8sattributes processor (runs on L1) to read K8s metadata.
+# The loadbalancing exporter 'dns' resolver needs NO extra RBAC.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: otel-l1l2-ns
+  # labels:
+  #   openshift.io/user-monitoring: "false"
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: otel-collector-sa
+  namespace: otel-l1l2-ns
+---
+kind: ClusterRole
+apiVersion: rbac.authorization.k8s.io/v1
+metadata:
+  name: otel-l1l2-collector-role
+rules:
+  - apiGroups: ['']
+    resources: ['pods', 'namespaces', 'nodes']
+    verbs: ['get', 'watch', 'list']
+  - apiGroups: ['apps']
+    resources: ['replicasets', 'deployments', 'daemonsets', 'statefulsets']
+    verbs: ['get', 'watch', 'list']
+  - apiGroups: ['batch']
+    resources: ['jobs', 'cronjobs']
+    verbs: ['get', 'list', 'watch']
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: otel-l1l2-collector-role-sa-binding
+subjects:
+  - kind: ServiceAccount
+    name: otel-collector-sa
+    namespace: otel-l1l2-ns
+roleRef:
+  kind: ClusterRole
+  name: otel-l1l2-collector-role
+  apiGroup: rbac.authorization.k8s.io
