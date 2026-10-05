@@ -6,9 +6,9 @@
 #   the L1 pod => WRONG K8s labels).
 # - Exposes the prometheus exporter :8889; the operator creates the ServiceMonitors
 #   (self-metrics + prometheus exporter) => UWM scrapes ONLY L2.
-# - headlessService: true => the Service 'otel-agg-collector' resolves to the L2 pod IPs
-#   (used by L1's loadbalancing 'dns' resolver). Verify real name and port 4317:
-#   oc get svc -n otel-l1l2-ns -o yaml
+# - The operator AUTO-CREATES 'otel-agg-collector-headless' (clusterIP=None -> resolves to
+#   the L2 pod IPs on 4317/4318/8889). That is what L1's loadbalancing 'dns' resolver targets.
+#   No spec.headlessService needed. Verify: oc get svc -n otel-l1l2-ns
 # ============================================================================
 apiVersion: opentelemetry.io/v1beta1
 kind: OpenTelemetryCollector
@@ -69,7 +69,7 @@ spec:
                     without_type_suffix: false
                     without_units: false
   mode: deployment
-  headlessService: true             # <-- needed for L1's 'dns' resolver (4317)
+  # NOTE: the operator auto-creates 'otel-agg-collector-headless' (no flag needed); L1 targets it.
   replicas: 2                        # lab: 2 fixed replicas
   # autoscaler: disabled in the lab; planned numbers (for prod). Remember: application
   # metrics are PARTITIONED across L2 replicas, so UWM head_series stays ~constant as N

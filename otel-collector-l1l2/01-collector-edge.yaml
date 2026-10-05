@@ -28,7 +28,7 @@ spec:
     enabled: false
     gateway: ''
   config:
-    exporters:
+    exporters:  
       loadbalancing:               # 0.158: name 'loadbalancing' ('load_balancing' is the new name)
         routing_key: attributes
         routing_attributes:
@@ -41,8 +41,8 @@ spec:
             timeout: 5s
         resolver:
           dns:
-            hostname: otel-agg-collector.otel-l1l2-ns.svc.cluster.local   # L2 headless Service (verify real name)
-            port: 4317
+            hostname: otel-agg-collector-headless   # operator auto-creates <name>-collector-headless (resolves to L2 pod IPs)
+            port: "4317"
             interval: 5s           # re-resolves the ring quickly when L2 scales
     processors:
       batch:
