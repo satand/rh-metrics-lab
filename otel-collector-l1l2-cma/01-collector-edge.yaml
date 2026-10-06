@@ -1,11 +1,18 @@
 # ============================================================================
-# L1 - otel-edge  (EDGE / deterministic router)   [dual-layer stack, ns otel-l1l2-ns]
+# L1 - otel-edge  (EDGE / deterministic router)   [dual-layer + CMA stack, ns otel-l1l2-ns]
 # - Receives OTLP/HTTP :4318 from the applications.
 # - Runs k8sattributes + filters + transform HERE (the 'connection' is the app pod).
 # - Routes to L2 with the loadbalancing exporter hashing on k8s.pod.name +
 #   k8s.namespace.name: the same app pod ALWAYS goes to the same L2 replica => no duplication.
 # - Does NOT expose a prometheus exporter: UWM scrapes no application data from here.
 #   Only the self-metrics ServiceMonitor (otelcol_*) stays, via enableMetrics.
+#
+# CMA variant differences vs otel-collector-l1l2/:
+#   - memory_limiter ENABLED (first processor) -> generates 'refused' backpressure and a
+#     bounded memory ceiling; REQUIRES spec.resources.limits.memory.
+#   - spec.resources.limits set -> so container_memory_working_set_bytes % of limit works.
+#   - spec.autoscaler intentionally ABSENT: replicas are owned by CMA/KEDA ScaledObject
+#     (see 04-so-otel-edge.yaml). Do NOT enable the operator autoscaler together with CMA.
 #
 # REQUIREMENT: the collector image must bundle the 'loadbalancing' exporter
 # (otelcol-contrib / otelcol-k8s distributions). If the image in use (service.name
@@ -28,7 +35,7 @@ spec:
     enabled: false
     gateway: ''
   config:
-    exporters:  
+    exporters:
       loadbalancing:               # 0.158: name 'loadbalancing' ('load_balancing' is the new name)
         routing_key: attributes
         routing_attributes:
@@ -40,12 +47,27 @@ spec:
             tls:
               insecure: true       # L2 exposes plain OTLP/gRPC
             timeout: 5s
+            retry_on_failure:
+              enabled: true
+              initial_interval: 5s
+              max_interval: 30s
+              max_elapsed_time: 300s
+            sending_queue:
+              enabled: true
+              num_consumers: 10
+            # CMA note: keep the otlp sending_queue enabled (default) for L1->L2 backpressure.
+            # Its otelcol_exporter_queue_* metrics are NOT exposed by the loadbalancing
+            # helper_exporter, so the edge scaler keys on otelcol_exporter_in_flight_requests.
         resolver:
           dns:
             hostname: otel-agg-collector-headless   # operator auto-creates <name>-collector-headless (resolves to L2 pod IPs)
             port: "4317"
             interval: 5s           # re-resolves the ring quickly when L2 scales
     processors:
+      memory_limiter:
+        check_interval: 1s
+        limit_percentage: 80        # soft ceiling = 80% of the container memory limit
+        spike_limit_percentage: 25  # reduce to (80-25)% when a spike is in flight
       batch:
         send_batch_max_size: 0
         send_batch_size: 8192
@@ -102,6 +124,7 @@ spec:
           receivers:
             - otlp
           processors:
+            - memory_limiter
             - filter/metrics
             - k8sattributes
             - transform
@@ -123,12 +146,16 @@ spec:
                     without_units: false
   mode: deployment
   headlessService: false
-  replicas: 2                       # lab: 2 fixed replicas
-  # autoscaler: disabled in the lab; planned numbers (for prod):
-  # autoscaler:
-  #   minReplicas: 2
-  #   maxReplicas: 4
-  #   targetCPUUtilization: 70
+  replicas: 2                       # base replicas; CMA/KEDA ScaledObject owns min/max
+  # NOTE: do NOT set spec.autoscaler here (CMA owns scaling). resources below enable both
+  # the memory_limiter ceiling and the Fase1 'memory % of limit' autoscaling signal.
+  resources:
+    requests:
+      cpu: 500m
+      memory: 512Mi
+    limits:
+      cpu: "1"
+      memory: 1Gi
   managementState: managed
   upgradeStrategy: automatic
   ingress:

@@ -1,0 +1,104 @@
+# CMA/KEDA autoscaling for L1 otel-edge (ns otel-l1l2-ns).
+# Scaling signal = User Workload Monitoring metrics (otelcol_* internal telemetry), read
+# through the OpenShift Thanos Querier (which federates UWM).
+# Target = the OpenTelemetryCollector CR via its /scale subresource (CONFIRMED present on
+# this cluster). KEDA writes spec.replicas -> operator propagates to the Deployment.
+#
+# 3-level model (read via the OpenShift Thanos Querier, one auth = keda-prom-creds-uwm):
+#   1) PRIMARY  capacity  : rate(accepted_metric_points) per replica  -> AverageValue
+#   2) EMERGENCY backpressure: L1 egress in-flight (-> L2) + refused -> Value/AverageValue
+#        (uses otelcol_exporter_in_flight_requests because otelcol_exporter_queue_* are NOT
+#         exposed by the loadbalancing helper_exporter in this build -> see trigger 2a)
+#   3) GUARDRAIL OOM      : sum(otelcol_process_memory_rss_bytes) -> AverageValue per replica
+#                           (bias-up; Go GC does not release, so this mostly triggers scale-UP)
+# CPU deliberately NOT used (a collector is not CPU-bound first; memory/GC is unreliable;
+# the point of KEDA is to react to the collector's own saturation signals).
+#
+# >>> endpoint: the Thanos Querier (federates UWM), NOT prometheus-user-workload:9091
+#     (that service only proxies /metrics+/federate -> /api/v1/query would 404). See 03-auth.
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: otel-edge-scaler
+  namespace: otel-l1l2-ns
+spec:
+  scaleTargetRef:
+    apiVersion: opentelemetry.io/v1beta1
+    kind: OpenTelemetryCollector
+    name: otel-edge
+  minReplicaCount: 2
+  maxReplicaCount: 6
+  pollingInterval: 15
+  cooldownPeriod: 180
+  advanced:
+    horizontalPodAutoscalerConfig:
+      behavior:
+        scaleUp:
+          stabilizationWindowSeconds: 15
+        scaleDown:
+          stabilizationWindowSeconds: 180
+  triggers:
+    # 1) PRIMARY: throughput (accepted metric points/sec) averaged per replica.
+    #    Recedes when app cardinality drops -> enables scale-DOWN too.
+    - type: prometheus
+      metricType: AverageValue
+      metadata:
+        serverAddress: https://thanos-querier.openshift-monitoring.svc.cluster.local:9091
+        # AverageValue => desired = ceil(totalPts/s / threshold), clamped to [min,max].
+        # PRODUCTION target ~2000 pts/s per replica. DEMO value is 20 because accepted_* here is
+        # cardinality-bound and tiny: ~14 pts/s @1 app pod -> ~110-220 @8-16 pods (push step 10s);
+        # at 2000 the scaler would never leave min (needs >4000 total = ~290 pods). With 20, the
+        # app-pod ramp 1->16 drives collectors 2->6. (Tune back to ~2000 for real load.)
+        threshold: '20'                 # <-- DEMO tuned; production ~2000 (see README)
+        query: sum(rate(otelcol_receiver_accepted_metric_points_total{namespace="otel-l1l2-ns",pod=~"otel-edge-collector-.*"}[2m]))
+        ignoreNullValues: 'false'
+        authModes: 'bearer'
+      authenticationRef:
+        name: keda-prom-creds-uwm
+
+    # 2a) EMERGENCY (early egress backpressure): L1 -> L2 export concurrency near the
+    #     sending-queue worker ceiling -> scale up. NOTE: this collector build (loadbalancing
+    #     with per-backend helper_exporter) does NOT expose otelcol_exporter_queue_* even at
+    #     telemetry level=detailed, so we use otelcol_exporter_in_flight_requests instead
+    #     (present at level=basic). AverageValue -> threshold is PER replica; set it just under
+    #     sending_queue.num_consumers (default 10) so it fires when a replica's workers peg.
+    - type: prometheus
+      metricType: AverageValue
+      metadata:
+        serverAddress: https://thanos-querier.openshift-monitoring.svc.cluster.local:9091
+        threshold: '8'
+        # isolate ONLY the egress loadbalancer's concurrency (debug / other exporters excluded)
+        query: sum(otelcol_exporter_in_flight_requests{namespace="otel-l1l2-ns",pod=~"otel-edge-collector-.*",exporter="loadbalancing"})
+        # 'true' here so a label drift / absence of this series won't error the whole ScaledObject
+        # (missing backpressure => treat as 0, simply don't scale on it)
+        ignoreNullValues: 'true'
+        authModes: 'bearer'
+      authenticationRef:
+        name: keda-prom-creds-uwm
+
+    # 2b) EMERGENCY: sustained refusal (memory_limiter shedding) -> scale up.
+    - type: prometheus
+      metricType: Value
+      metadata:
+        serverAddress: https://thanos-querier.openshift-monitoring.svc.cluster.local:9091
+        threshold: '1'                  # >1 refused point/sec -> react (avoid threshold 0 = div-by-zero)
+        query: sum(rate(otelcol_receiver_refused_metric_points_total{namespace="otel-l1l2-ns",pod=~"otel-edge-collector-.*"}[2m]))
+        ignoreNullValues: 'false'
+        authModes: 'bearer'
+      authenticationRef:
+        name: keda-prom-creds-uwm
+
+    # 3) GUARDRAIL OOM: keep PER-REPLICA RSS under ~80% of the container memory limit.
+    #    AverageValue over sum(...) -> desired = ceil(totalRSS / threshold). (With `max`+Value
+    #    it could only ever reach ceil(1Gi/0.8Gi)=1 = the min and never scaled.) sum+AverageValue
+    #    actually ramps replicas so each pod's RSS falls back under the per-replica target.
+    - type: prometheus
+      metricType: AverageValue
+      metadata:
+        serverAddress: https://thanos-querier.openshift-monitoring.svc.cluster.local:9091
+        threshold: '858993459'          # per-replica target ~80% of the 1Gi limit (bytes)  <-- keep in sync with spec.resources.limits
+        query: sum(otelcol_process_memory_rss_bytes{namespace="otel-l1l2-ns",pod=~"otel-edge-collector-.*"})
+        ignoreNullValues: 'false'
+        authModes: 'bearer'
+      authenticationRef:
+        name: keda-prom-creds-uwm

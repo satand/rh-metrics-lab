@@ -1,0 +1,52 @@
+# ============================================================================
+# Auth for the KEDA Prometheus scaler. On OpenShift the in-cluster Prometheus QUERY
+# API (which also federates User Workload Monitoring metrics) is the Thanos Querier:
+#   https://thanos-querier.openshift-monitoring.svc.cluster.local:9091/api/v1/query
+# (the prometheus-user-workload Service only proxies /metrics and /federate via
+# kube-rbac-proxy, NOT /api/v1/query -> that is what produced the HTTP 404).
+# A bearer token from this ServiceAccount, bound to the built-in 'cluster-monitoring-view'
+# ClusterRole, authorizes the query; the token Secret also carries ca.crt for TLS verify.
+# The 04-so-otel-edge.yaml / 05-so-otel-agg.yaml triggers use authenticationRef: keda-prom-creds-uwm.
+# VERIFY: otelcol_* actually present (collector self-metrics ServiceMonitors scraped by UWM).
+# ============================================================================
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: keda-prometheus-uwm
+  namespace: otel-l1l2-ns
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: keda-prometheus-uwm-token
+  namespace: otel-l1l2-ns
+  annotations:
+    kubernetes.io/service-account.name: keda-prometheus-uwm
+type: kubernetes.io/service-account-token
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: keda-prometheus-uwm-view
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: cluster-monitoring-view        # built-in: grants /api/v1 query access to Thanos Querier
+subjects:
+  - kind: ServiceAccount
+    name: keda-prometheus-uwm
+    namespace: otel-l1l2-ns
+---
+apiVersion: keda.sh/v1alpha1
+kind: TriggerAuthentication
+metadata:
+  name: keda-prom-creds-uwm
+  namespace: otel-l1l2-ns
+spec:
+  secretTargetRef:
+    - parameter: bearerToken
+      name: keda-prometheus-uwm-token
+      key: token
+    - parameter: ca
+      name: keda-prometheus-uwm-token
+      key: ca.crt

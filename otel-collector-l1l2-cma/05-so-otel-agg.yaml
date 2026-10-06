@@ -1,0 +1,80 @@
+# CMA/KEDA autoscaling for L2 otel-agg (ns otel-l1l2-ns).
+# Scaling signal = USER WORKLOAD Monitoring Prometheus (otelcol_* internal telemetry).
+# Target = the OpenTelemetryCollector CR via its /scale subresource.
+# L2 is a STATEFUL PULL aggregator (prometheus exporter serves /metrics; NO egress queue),
+# so its saturation shows as memory/refused, NOT exporter queue. Application metrics are
+# PARTITIONED across L2 replicas, so UWM head_series stays ~constant as N changes.
+#
+# 3-level model (read via the OpenShift Thanos Querier, auth keda-prom-creds-uwm):
+#   1) PRIMARY  capacity  : rate(accepted_metric_points) per replica -> AverageValue (recedes)
+#   2) EMERGENCY anti-drop: rate(refused)  -> Value >0  (memory_limiter is shedding)
+#   3) GUARDRAIL OOM      : sum(otelcol_process_memory_rss_bytes) -> AverageValue per replica
+#                           (bias-up; Go won't release, so this mostly triggers scale-UP)
+#
+# >>> endpoint: the Thanos Querier (federates UWM), NOT prometheus-user-workload:9091 (that
+#     service only proxies /metrics+/federate -> /api/v1/query 404s). See 03-auth-uwm.yaml.
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: otel-agg-scaler
+  namespace: otel-l1l2-ns
+spec:
+  scaleTargetRef:
+    apiVersion: opentelemetry.io/v1beta1
+    kind: OpenTelemetryCollector
+    name: otel-agg
+  minReplicaCount: 2
+  maxReplicaCount: 6
+  pollingInterval: 15
+  cooldownPeriod: 180
+  advanced:
+    horizontalPodAutoscalerConfig:
+      behavior:
+        scaleUp:
+          stabilizationWindowSeconds: 15
+        scaleDown:
+          stabilizationWindowSeconds: 180   # avoid flapping on cumulative memory steps
+  triggers:
+    # 1) PRIMARY: throughput (accepted metric points/sec) averaged per replica.
+    - type: prometheus
+      metricType: AverageValue
+      metadata:
+        serverAddress: https://thanos-querier.openshift-monitoring.svc.cluster.local:9091
+        # AverageValue => desired = ceil(totalPts/s / threshold), clamped to [min,max].
+        # PRODUCTION target ~2000 pts/s per replica. DEMO value is 20 because accepted_* here is
+        # cardinality-bound and tiny: ~14 pts/s @1 app pod -> ~110-220 @8-16 pods (push step 10s);
+        # at 2000 the scaler would never leave min (needs >4000 total = ~290 pods). With 20, the
+        # app-pod ramp 1->16 drives collectors 2->6. (Tune back to ~2000 for real load.)
+        threshold: '20'                 # <-- DEMO tuned; production ~2000 (see README)
+        query: sum(rate(otelcol_receiver_accepted_metric_points_total{namespace="otel-l1l2-ns",pod=~"otel-agg-collector-.*"}[2m]))
+        ignoreNullValues: 'false'
+        authModes: 'bearer'
+      authenticationRef:
+        name: keda-prom-creds-uwm
+
+    # 2) EMERGENCY: sustained refusal (memory_limiter shedding) -> scale up fast.
+    - type: prometheus
+      metricType: Value
+      metadata:
+        serverAddress: https://thanos-querier.openshift-monitoring.svc.cluster.local:9091
+        threshold: '1'                  # >1 refused point/sec -> react (avoid threshold 0 = div-by-zero)
+        query: sum(rate(otelcol_receiver_refused_metric_points_total{namespace="otel-l1l2-ns",pod=~"otel-agg-collector-.*"}[2m]))
+        ignoreNullValues: 'false'
+        authModes: 'bearer'
+      authenticationRef:
+        name: keda-prom-creds-uwm
+
+    # 3) GUARDRAIL OOM: keep PER-REPLICA RSS under ~80% of the container memory limit.
+    #    AverageValue over sum(...) -> desired = ceil(totalRSS / threshold). (With `max`+Value
+    #    it could only ever reach ceil(1Gi/0.8Gi)=1 = the min and never scaled.) sum+AverageValue
+    #    actually ramps replicas so each pod's RSS falls back under the per-replica target.
+    - type: prometheus
+      metricType: AverageValue
+      metadata:
+        serverAddress: https://thanos-querier.openshift-monitoring.svc.cluster.local:9091
+        threshold: '858993459'          # per-replica target ~80% of the 1Gi limit (bytes)  <-- keep in sync with spec.resources.limits
+        query: sum(otelcol_process_memory_rss_bytes{namespace="otel-l1l2-ns",pod=~"otel-agg-collector-.*"})
+        ignoreNullValues: 'false'
+        authModes: 'bearer'
+      authenticationRef:
+        name: keda-prom-creds-uwm

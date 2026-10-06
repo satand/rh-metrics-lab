@@ -88,11 +88,11 @@ spec:
         env:
         # 1. Collector OTLP/HTTP endpoint (Micrometer needs the FULL URL incl. /v1/metrics).
         #    Enable ONE (default = single-layer):
-        - name: MANAGEMENT_OTLP_METRICS_EXPORT_URL
-          value: "http://otel-collector.otel-ns.svc.cluster.local:4318/v1/metrics"
-        #    dual-layer (otel-edge L1 in otel-l1l2-ns): comment the block above, uncomment this:
         # - name: MANAGEMENT_OTLP_METRICS_EXPORT_URL
-        #   value: "http://otel-edge-collector.otel-l1l2-ns.svc.cluster.local:4318/v1/metrics"
+        #   value: "http://otel-collector.otel-ns.svc.cluster.local:4318/v1/metrics"
+        #    dual-layer (otel-edge L1 in otel-l1l2-ns): comment the block above, uncomment this:
+        - name: MANAGEMENT_OTLP_METRICS_EXPORT_URL
+          value: "http://otel-edge-collector.otel-l1l2-ns.svc.cluster.local:4318/v1/metrics"
 
         # 2. Publish interval (a new push every 10s -> new balancing decision)
         - name: MANAGEMENT_OTLP_METRICS_EXPORT_STEP

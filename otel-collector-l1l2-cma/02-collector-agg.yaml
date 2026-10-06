@@ -1,0 +1,117 @@
+# ============================================================================
+# L2 - otel-agg  (AGGREGATOR, the only layer scraped by UWM)  [dual-layer + CMA, ns otel-l1l2-ns]
+# - Receives OTLP/gRPC :4317 from L1 (and OTLP/HTTP :4318 for flexibility).
+# - k8sattributes / filter / transform are NOT re-run here: resource attributes are
+#   already enriched & cleaned by L1 (re-running here would bind the 'connection', i.e.
+#   the L1 pod => WRONG K8s labels).
+# - Exposes the prometheus exporter :8889; the operator creates the ServiceMonitors
+#   (self-metrics + prometheus exporter) => UWM scrapes ONLY L2.
+# - The operator AUTO-CREATES 'otel-agg-collector-headless' (clusterIP=None -> L2 pod IPs
+#   on 4317/4318/8889); that's what L1's loadbalancing 'dns' resolver targets. No flag needed.
+#
+# CMA variant differences vs otel-collector-l1l2/:
+#   - memory_limiter ENABLED (before batch) -> 'refused' backpressure + bounded ceiling.
+#   - spec.resources.limits.memory set -> % of limit autoscaling signal works.
+#   - spec.autoscaler intentionally ABSENT: CMA/KEDA ScaledObject owns replicas.
+#   NOTE: the prometheus exporter is a PULL exporter (no egress queue), so L2 scales on
+#   MEMORY (Fase1) and on refused-rate (Fase2), NOT on exporter queue like L1.
+# ============================================================================
+apiVersion: opentelemetry.io/v1beta1
+kind: OpenTelemetryCollector
+metadata:
+  name: otel-agg
+  namespace: otel-l1l2-ns
+spec:
+  networkPolicy:
+    enabled: true
+  observability:
+    metrics:
+      enableMetrics: true
+  deploymentUpdateStrategy: {}
+  httpRoute:
+    enabled: false
+    gateway: ''
+  config:
+    exporters:
+      debug:
+        verbosity: normal #basic
+      prometheus:
+        endpoint: '0.0.0.0:8889'
+        without_scope_info: true
+        resource_to_telemetry_conversion:
+          enabled: true
+    processors:
+      memory_limiter:
+        check_interval: 1s
+        limit_percentage: 80        # soft ceiling = 80% of the container memory limit
+        spike_limit_percentage: 25
+      batch:
+        send_batch_max_size: 0
+        send_batch_size: 8192
+        timeout: 10s
+    receivers:
+      otlp:
+        protocols:
+          grpc:
+            endpoint: '0.0.0.0:4317'
+          http:
+            endpoint: '0.0.0.0:4318'
+    service:
+      pipelines:
+        metrics/pull:
+          receivers:
+            - otlp
+          processors:
+            - memory_limiter
+            - batch
+          exporters:
+            - debug
+            - prometheus
+      telemetry:
+        metrics:
+          level: basic
+          readers:
+            - pull:
+                exporter:
+                  prometheus:
+                    host: 0.0.0.0
+                    port: 8888
+                    without_scope_info: false
+                    without_type_suffix: false
+                    without_units: false
+  mode: deployment
+  # The operator auto-creates 'otel-agg-collector-headless' (no flag needed); L1 targets it.
+  replicas: 2                        # base replicas; CMA/KEDA ScaledObject owns min/max
+  # NOTE: do NOT set spec.autoscaler here (CMA owns scaling). Because application metrics
+  # are PARTITIONED across L2 replicas, UWM head_series stays ~constant as N changes; we
+  # scale L2 on MEMORY (OOM guard) and on refused-rate (leading). When UWM guardrails are
+  # enabled, set enforcedTargetLimit >= maxReplicas.
+  resources:
+    requests:
+      cpu: 500m
+      memory: 512Mi
+    limits:
+      cpu: "1"
+      memory: 1Gi
+  managementState: managed
+  upgradeStrategy: automatic
+  ingress:
+    route: {}
+  podDnsConfig: {}
+  daemonSetUpdateStrategy: {}
+  serviceAccount: otel-collector-sa
+  ipFamilyPolicy: SingleStack
+  configVersions: 3
+---
+# Template (NOT applied): protects one ring slice from voluntary drain during scale-down.
+# Enable when you move to real autoscaling.
+# apiVersion: policy/v1
+# kind: PodDisruptionBudget
+# metadata:
+#   name: otel-agg-pdb
+#   namespace: otel-l1l2-ns
+# spec:
+#   minAvailable: 1
+#   selector:
+#     matchLabels:
+#       app.kubernetes.io/instance: otel-agg

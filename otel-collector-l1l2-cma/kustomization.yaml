@@ -1,0 +1,13 @@
+# Dual-layer OpenTelemetry Collector + OpenShift CMA/KEDA autoscaling.
+# Scaling signal is USER WORKLOAD Monitoring (otelcol_*); see README.md.
+# KEDA is already provisioned by the CMA operator's default KedaController (ns openshift-keda),
+# so these ScaledObjects work as soon as they are applied.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+  - 00-rbac.yaml
+  - 01-collector-edge.yaml
+  - 02-collector-agg.yaml
+  - 03-auth-uwm.yaml
+  - 04-so-otel-edge.yaml
+  - 05-so-otel-agg.yaml

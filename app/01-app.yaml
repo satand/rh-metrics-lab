@@ -46,12 +46,12 @@ spec:
 
         # 2. Collector OTLP endpoint (port 4318). Enable ONE (default = single-layer):
         #    single-layer: the original 'otel' CR service in otel-ns
-        - name: OTEL_EXPORTER_OTLP_ENDPOINT
-          value: "http://otel-collector.otel-ns.svc.cluster.local:4318"
+        # - name: OTEL_EXPORTER_OTLP_ENDPOINT
+        #   value: "http://otel-collector.otel-ns.svc.cluster.local:4318"
         #    dual-layer: the L1 'otel-edge' service in otel-l1l2-ns
         #    (comment the block above, uncomment the two lines below):
-        # - name: OTEL_EXPORTER_OTLP_ENDPOINT
-        #   value: "http://otel-edge-collector.otel-l1l2-ns.svc.cluster.local:4318"
+        - name: OTEL_EXPORTER_OTLP_ENDPOINT
+          value: "http://otel-edge-collector.otel-l1l2-ns.svc.cluster.local:4318"
 
         # 3. Metadata / SDK configuration
         - name: OTEL_SERVICE_NAME
