@@ -8,8 +8,8 @@
 # 3-level model (read via the OpenShift Thanos Querier, auth keda-prom-creds-uwm):
 #   1) PRIMARY  capacity  : rate(accepted_metric_points) per replica -> AverageValue (recedes)
 #   2) EMERGENCY anti-drop: rate(refused)  -> Value >0  (memory_limiter is shedding)
-#   3) GUARDRAIL OOM      : sum(otelcol_process_memory_rss_bytes) -> AverageValue per replica
-#                           (bias-up; Go won't release, so this mostly triggers scale-UP)
+#   3) GUARDRAIL OOM      : sum(otelcol_process_memory_rss_bytes) -> AverageValue ~0.8·limit
+#                           (dormant at rest; ramps only under load-driven RSS; demo tripwire in README)
 #
 # >>> endpoint: the Thanos Querier (federates UWM), NOT prometheus-user-workload:9091 (that
 #     service only proxies /metrics+/federate -> /api/v1/query 404s). See 03-auth-uwm.yaml.
@@ -64,15 +64,18 @@ spec:
       authenticationRef:
         name: keda-prom-creds-uwm
 
-    # 3) GUARDRAIL OOM: keep PER-REPLICA RSS under ~80% of the container memory limit.
-    #    AverageValue over sum(...) -> desired = ceil(totalRSS / threshold). (With `max`+Value
-    #    it could only ever reach ceil(1Gi/0.8Gi)=1 = the min and never scaled.) sum+AverageValue
-    #    actually ramps replicas so each pod's RSS falls back under the per-replica target.
+    # 3) GUARDRAIL OOM: keep aggregate RSS scaling only under REAL pressure. AverageValue over
+    #    sum(...) => desired=ceil(totalRSS/threshold); with the target ABOVE the Go baseline floor
+    #    (~114 MB/pod) this is DORMANT at rest (scales down to min) and only ramps when load-driven
+    #    buffering pushes per-replica RSS up -> calm + stable. Keep in sync with resources.limits.
+    #    To DEMONSTRATE this tripwire firing, see README "Forcing the EMERGENCY / GUARDRAIL triggers":
+    #    temporarily switch to Value over max(...) with a target below baseline (expect it to pin
+    #    toward maxReplicaCount, so revert afterwards).
     - type: prometheus
       metricType: AverageValue
       metadata:
         serverAddress: https://thanos-querier.openshift-monitoring.svc.cluster.local:9091
-        threshold: '858993459'          # per-replica target ~80% of the 1Gi limit (bytes)  <-- keep in sync with spec.resources.limits
+        threshold: '858993459'          # ~80% of the 1Gi limit (bytes) <-- keep in sync with spec.resources.limits --> dormant at ~114 MB baseline
         query: sum(otelcol_process_memory_rss_bytes{namespace="otel-l1l2-ns",pod=~"otel-agg-collector-.*"})
         ignoreNullValues: 'false'
         authModes: 'bearer'

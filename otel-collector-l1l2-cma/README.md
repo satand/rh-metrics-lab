@@ -21,7 +21,7 @@ names). Apply **EITHER** `otel-collector-l1l2/` **OR** this `-cma` variant, **no
 |---|---|---|---|
 | **1 PRIMARY** capacity | `rate(otelcol_receiver_accepted_metric_points_total[2m])` | `AverageValue`, **demo** `20` pts/s per replica (production `~2000`; see note) | tracks cardinality; **recedes → also scales DOWN** |
 | **2 EMERGENCY** backpressure / anti-drop | L1: `otelcol_exporter_in_flight_requests` (worker-ceiling proxy, per replica) + `rate(refused)`; L2: `rate(refused)` | `AverageValue` `8` (in-flight) + `Value` `>1` (refused) | react to L1 egress saturation / any shedding → fast scale-up |
-| **3 GUARDRAIL** OOM | `sum(otelcol_process_memory_rss_bytes)` | `AverageValue`, ~80% of the limit **per replica** | last-resort (bias-up only; Go won't release → scale-UP) |
+| **3 GUARDRAIL** OOM | `sum(otelcol_process_memory_rss_bytes)` | `AverageValue`, ~0.8·limit per replica | dormant at rest (RSS floor ~114 MB); ramps under real load — see "Forcing…" to demo it fire |
 
 > Why **in-flight**, not queue depth: `otelcol_exporter_queue_size/capacity/utilization` are **not**
 > exposed by the `loadbalancing` `helper_exporter` in this build (verified even at collector telemetry
@@ -59,12 +59,19 @@ Mapping in *our* triggers and why:
 | throughput (`accepted`) | AverageValue | `sum(rate(...))` | scales with cardinality; **recedes → enables scale-DOWN** |
 | refused | Value | `sum(rate(...))`, thr `1` | any sustained shedding → `ceil(refused/1)` jump, clamped to max |
 | in-flight (L1 only) | AverageValue | `sum(...{exporter="loadbalancing"})`, thr `8` | fires when a replica's export workers near `num_consumers` (~10) |
-| memory (OOM guardrail) | **AverageValue** | **`sum(otelcol_process_memory_rss_bytes)`**, thr ~0.8·limit | `desired=ceil(totalRSS/thr)` ramps once a **replica** crosses ~80% |
+| memory (OOM guardrail) | AverageValue | `sum(otelcol_process_memory_rss_bytes)`, thr ~0.8·limit | dormant at rest; ramps on load-driven RSS (low-target demo variant pins to max — see Forcing) |
 
-> ⚠️ Memory **must** be `AverageValue` over `sum(...)`. With `Value` + `max(...)` the metric can only
-> ever yield `ceil(1Gi / 0.8Gi)=1`, i.e. it can **never** exceed `minReplicaCount` → an **inert**
-> guardrail. This was the original bug (fixed on **both** L1 `04` and L2 `05`).
-> Final value is always clamped to `minReplicaCount … maxReplicaCount`.
+> ⚠️ **Memory guardrail (both layers)** — the Go collector holds a **baseline RSS floor ≈ 114 MB** per
+> pod that lazy GC never frees. The **committed default** is `AverageValue` over `sum(...)` at ~**0.8·limit**:
+> that sits ABOVE the floor → **dormant at rest** (collectors fall back to `minReplicaCount`) and ramps
+> only when *load-driven* buffering grows RSS → stable & calm.
+> Two traps we verified, so don't do them as the resting config:
+> - Making it "trip at rest" with a **low `Value`/`max` target**: with KEDA this drove L2 to
+>   `maxReplicaCount` and the scale-down wobbled via the stabilization window — good only as a **transient
+>   demo knob** (see "Forcing the EMERGENCY / GUARDRAIL triggers"), then revert to `AverageValue`/`sum`.
+> - **Lowering the cgroup `limits.memory`** to force an 80%-trip: parks RSS >80% of the hard limit →
+>   **OOMKill** risk and makes `memory_limiter` **shed** (contaminates `refused`). Keep the real limit
+>   generous; trigger memory by *load* (or the transient knob), never by shrinking the container limit.
 
 Check what the autoscaler wants right now:
 ```
@@ -137,7 +144,7 @@ scripts/load-drive.sh idle          # stop traffic + min replicas -> collector d
 Watch the Micrometer replicas drive `otelcol_..._accepted_metric_points` up/down on UWM and the
 two collectors follow (up on capacity/emergency, down after `cooldownPeriod` once rate recedes).
 
-## Forcing the EMERGENCY triggers (lab-only, then revert)
+## Forcing the EMERGENCY / GUARDRAIL triggers (lab-only, then revert)
 The **primary** throughput signal is what a normal load test exercises; the emergency triggers
 need real saturation, so here is how to make each one fire **deterministically**:
 
@@ -160,6 +167,26 @@ need real saturation, so here is how to make each one fire **deterministically**
   its own collector NetworkPolicies and ingress is the **union** of all policies; (b) CPU-starving
   L2 to `1m` — single small warm-HTTP/2 gRPC calls still complete sub-ms at lab volume, so
   concurrency never builds. It stays a **latent prod tripwire** (kept safe with `ignoreNullValues:'true'`).
+
+- **GUARDRAIL OOM / memory (s2 on L2).** The committed guardrail is **dormant** (`AverageValue`/`sum`
+  @~0.8·1Gi). To **demonstrate it firing** (and the "L1 on throughput vs L2 on memory" contrast) temporarily
+  flip the L2 memory trigger to a **low `Value`/`max` target** at runtime, then **revert**:
+  ```
+  # FIRE: make the guardrail trip at rest on the ~114 MB baseline RSS (Value/max, 50 MB target)
+  oc patch scaledobject otel-agg-scaler -n otel-l1l2-ns --type=json -p '[
+    {"op":"replace","path":"/spec/triggers/2/metricType","value":"Value"},
+    {"op":"replace","path":"/spec/triggers/2/metadata/query","value":"max(otelcol_process_memory_rss_bytes{namespace=\"otel-l1l2-ns\",pod=~\"otel-agg-collector-.*\"})"},
+    {"op":"replace","path":"/spec/triggers/2/metadata/threshold","value":"50000000"}]'
+  # observe: agg HPA event "New size: N; reason: external metric s2-prometheus … above target"
+  #          while edge stays at min (its accepted 15 < 20)  -> two layers, two metrics
+  # REVERT to the committed dormant form:
+  oc apply -f otel-collector-l1l2-cma/05-so-otel-agg.yaml
+  ```
+  What we observed: L2 jumped to **`maxReplicaCount` (6)** purely on memory, with `accepted≈0` (so it is the
+  memory tripwire, not capacity). **Caveat (verified):** KEDA treats this external `Value` memory metric in a
+  replica-sensitive way + the 180 s scale-down stabilization makes it **pin near max / wobble on the way
+  down** — so use it only as a *transient* demo and **revert**; do **not** leave a low memory target as the
+  resting config, and never reach this by shrinking the container limit (OOM + `memory_limiter` shedding).
 
 ## Acceptance
 - Collectors scale up on load and **down** after load is removed (thanks to the receding
