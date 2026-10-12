@@ -135,6 +135,7 @@ spec:
         protocols:
           http:
             endpoint: '0.0.0.0:4318'
+            # keep_alives_enabled: false
     service:
       pipelines:
         metrics/pull:

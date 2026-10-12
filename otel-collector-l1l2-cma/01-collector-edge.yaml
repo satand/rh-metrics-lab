@@ -36,7 +36,7 @@ spec:
     gateway: ''
   config:
     exporters:
-      loadbalancing:               # 0.158: name 'loadbalancing' ('load_balancing' is the new name)
+      load_balancing:              # 0.158: name 'loadbalancing' ('load_balancing' is the new name)
         routing_key: attributes
         routing_attributes:
           - k8s.pod.name
@@ -80,7 +80,7 @@ spec:
             - instrumentation_scope.name == "io.opentelemetry.exporters.otlp-http"
             - instrumentation_scope.name == "io.opentelemetry.sdk.logs"
             - instrumentation_scope.name == "io.opentelemetry.sdk.trace"
-      k8sattributes:
+      k8s_attributes:
         extract:
           metadata:
             - k8s.node.name
@@ -118,6 +118,10 @@ spec:
         protocols:
           http:
             endpoint: '0.0.0.0:4318'
+            # keep_alives_enabled: false
+            # keepalive:    # from RHBOT v0.160.0 --> https://github.com/open-telemetry/opentelemetry-collector/releases/tag/v0.160.0
+            #   enabled: false
+
     service:
       pipelines:
         metrics/push:
@@ -126,12 +130,12 @@ spec:
           processors:
             - memory_limiter
             - filter/metrics
-            - k8sattributes
+            - k8s_attributes
             - transform
             - transform/clean_resource
             - batch
           exporters:
-            - loadbalancing
+            - load_balancing
       telemetry:
         metrics:
           level: basic
